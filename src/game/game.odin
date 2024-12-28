@@ -22,7 +22,7 @@ State :: enum {
 	Undefined = 0,
 	Idle,
 	PlaceBuilding,
-	PipeLaying,
+	PlacePiping,
 }
 
 set_state_inner :: proc(state: ^State, new_state: State) {
@@ -50,11 +50,46 @@ update_state :: proc(state: ^State, dt: f32) {
 	assert(i != max_transitions)
 }
 
-pipe_reset_len: Maybe(int) = nil
 new_unit := Unit {
-	pos  = {-100, -100},
-	size = {GRID_SIZE * 2, GRID_SIZE * 2},
+	rect = {-100, -100, GRID_SIZE * 2, GRID_SIZE * 2},
 }
+
+valid_placement := true
+invalid_point := rl.Vector2{}
+start_unit: Maybe(int) = 0
+
+rect_edges :: proc(r: rl.Rectangle) -> [8]rl.Vector2 {
+	return [8]rl.Vector2 {
+		// top
+		rl.Vector2{r.x, r.y},
+		rl.Vector2{r.x + r.width, r.y},
+		// bottom
+		rl.Vector2{r.x, r.y + r.height},
+		rl.Vector2{r.x + r.width, r.y + r.height},
+		// left
+		rl.Vector2{r.x, r.y},
+		rl.Vector2{r.x, r.y + r.height},
+		// right
+		rl.Vector2{r.x + r.width, r.y},
+		rl.Vector2{r.x + r.width, r.y + r.height},
+	}
+}
+
+
+PipeConnection :: struct {
+	from:       uint,
+	to:         uint,
+	pipe_start: uint,
+	pipe_end:   uint,
+}
+pipe_graph := make(map[uint][dynamic]PipeConnection)
+pipe_reset_len: Maybe(int) = nil
+
+connect_units :: proc(from, to, pipe_start, pipe_end: uint) {
+	append(&pipe_graph[from], PipeConnection{from = from, to = to, pipe_start = pipe_start, pipe_end = pipe_end})
+	append(&pipe_graph[to], PipeConnection{from = to, to = from, pipe_start = pipe_start, pipe_end = pipe_end})
+}
+
 handle_event :: proc(event: Event, dt: f32) -> State {
 	if event.transition == .Update && dt > 0 && rl.IsKeyPressed(.TAB) {
 		ctx.view_mode = ViewMode((int(ctx.view_mode) + 1) % len(ViewMode))
@@ -62,34 +97,96 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 	}
 
 	pos := rl.GetMousePosition()
+	snap_pos := snap(pos)
 
 	switch event {
+	case Event{.Enter, .Idle}:
+		// hide invalid marking placements
+		valid_placement = true
+
 	case Event{.Update, .Idle}:
-		if rl.IsMouseButtonPressed(.LEFT) {
+		if rl.IsMouseButtonPressed(.LEFT) && dt > 0 {
 			switch ctx.view_mode {
 			case .Above:
 				return .PlaceBuilding
 			case .Below:
-				return .PipeLaying
+				return .PlacePiping
 			}
 		}
 	case Event{.Update, .PlaceBuilding}:
 		assert(ctx.view_mode == .Above)
-		new_unit.pos = snap(rl.GetMousePosition())
-		if rl.IsMouseButtonPressed(.LEFT) && dt > 0 {
+		new_unit.rect.x = snap_pos.x
+		new_unit.rect.y = snap_pos.y
+		valid_placement = true
+		for unit in ctx.units {
+			valid_placement &= !rl.CheckCollisionRecs(new_unit.rect, unit.rect)
+		}
+
+		if valid_placement && rl.IsMouseButtonPressed(.LEFT) && dt > 0 {
 			append(&ctx.units, new_unit)
+			particles.create_system(
+				&new_unit.rect,
+				origin_distribution = particles.rect,
+				color = rl.Color{163, 106, 31, 100},
+				particle_lifetime = 0.6,
+			)
 		}
 		if rl.IsMouseButtonPressed(.RIGHT) {
 			return .Idle
 		}
-	case Event{.Enter, .PipeLaying}:
+	case Event{.Enter, .PlacePiping}:
+		start_unit = nil
+		for unit, i in ctx.units {
+			if rl.CheckCollisionPointRec(snap(pos), unit.rect) {
+				start_unit = i
+				break
+			}
+		}
+		if start_unit == nil {
+			// cancel
+			return .Idle
+		}
 		pipe_reset_len = len(ctx.pipes)
+
 		append(&ctx.pipes, snap(pos))
 		append(&ctx.pipes, pos)
-	case Event{.Update, .PipeLaying}:
-		assert(ctx.view_mode == .Below)
+	case Event{.Update, .PlacePiping}:
+		valid_placement = true
+
+		pipe_len := len(ctx.pipes) - pipe_reset_len.?
 		ctx.pipes[len(ctx.pipes) - 1] = snap(pos)
-		if rl.IsMouseButtonPressed(.LEFT) {
+
+		for i in 1 ..< len(ctx.pipes) - 2 {
+			if ctx.pipes[i] == PIPE_END || ctx.pipes[i - 1] == PIPE_END {
+				continue
+			}
+
+			valid_placement &= !rl.CheckCollisionLines(
+				ctx.pipes[i],
+				ctx.pipes[i - 1],
+				ctx.pipes[len(ctx.pipes) - 1],
+				ctx.pipes[len(ctx.pipes) - 2],
+				&invalid_point,
+			)
+		}
+
+		for unit, i in ctx.units {
+			if i == start_unit.? && pipe_len <= 2 {
+				continue
+			}
+			edges := rect_edges(unit.rect)
+			for j := 0; j < len(edges); j += 2 {
+				valid_placement &= !rl.CheckCollisionLines(
+					edges[j],
+					edges[j + 1],
+					ctx.pipes[len(ctx.pipes) - 1],
+					ctx.pipes[len(ctx.pipes) - 2],
+					&invalid_point,
+				)
+			}
+		}
+
+		if rl.IsMouseButtonPressed(.LEFT) && valid_placement && dt > 0 {
 			append(&ctx.pipes, snap(pos))
 		}
 
@@ -99,7 +196,7 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 			ctx.pipes[len(ctx.pipes) - 1] = PIPE_END
 			return .Idle
 		}
-	case Event{.Exit, .PipeLaying}:
+	case Event{.Exit, .PlacePiping}:
 		if pipe_reset_len, ok := pipe_reset_len.?; ok {
 			resize(&ctx.pipes, pipe_reset_len)
 		}
@@ -114,8 +211,7 @@ GRID_SIZE :: 64
 BACKGROUND_COLOR :: rl.Color{196, 168, 110, 255}
 
 Unit :: struct {
-	pos:  rl.Vector2,
-	size: rl.Vector2,
+	rect: rl.Rectangle,
 }
 
 ViewMode :: enum {
@@ -260,17 +356,14 @@ frame :: proc() {
 		case .Above:
 			rl.ClearBackground(BACKGROUND_COLOR)
 			{
+				for unit in ctx.units {
+					rl.DrawRectangleRec(unit.rect, rl.GRAY)
+				}
+
 				if ctx.ui_state == .PlaceBuilding {
 					render_grid(rl.GetMousePosition(), rl.RED)
 
-					rl.DrawRectangleRec(
-						{new_unit.pos.x, new_unit.pos.y, new_unit.size.x, new_unit.size.y},
-						rl.Fade(rl.GRAY, 0.5),
-					)
-				}
-
-				for unit in ctx.units {
-					rl.DrawRectangleRec({unit.pos.x, unit.pos.y, unit.size.x, unit.size.y}, rl.GRAY)
+					rl.DrawRectangleRec(new_unit.rect, rl.Fade(rl.GRAY if valid_placement else rl.RED, 0.5))
 				}
 
 				particles.render_particles()
@@ -278,21 +371,32 @@ frame :: proc() {
 		case .Below:
 			rl.ClearBackground(rl.BLACK)
 			{
-				if ctx.ui_state == .PipeLaying {
+				if ctx.ui_state == .PlacePiping {
 					render_grid(rl.GetMousePosition(), rl.GRAY)
 				}
 
 				for unit in ctx.units {
-					rl.DrawRectangleRec({unit.pos.x, unit.pos.y, unit.size.x, unit.size.y}, rl.WHITE)
+					rl.DrawRectangleRec(unit.rect, rl.WHITE)
 				}
 
 				if len(ctx.pipes) > 1 {
 					for i in 1 ..< len(ctx.pipes) {
+						color := rl.RED if !valid_placement && i > pipe_reset_len.? else rl.WHITE
+						if i == 1 {
+							rl.DrawCircleV(ctx.pipes[0], 5, color)
+						}
 						if ctx.pipes[i] == PIPE_END || ctx.pipes[i - 1] == PIPE_END {
 							continue
 						}
-						rl.DrawLineEx(ctx.pipes[i - 1], ctx.pipes[i], 2, rl.WHITE)
+						rl.DrawLineEx(ctx.pipes[i - 1], ctx.pipes[i], 10, color)
+						rl.DrawCircleV(ctx.pipes[i], 5, color)
 					}
+				}
+
+				// draw x indicator for intersectino
+				if !valid_placement {
+					rl.DrawLineEx(invalid_point + rl.Vector2{-10, -10}, invalid_point + rl.Vector2{10, 10}, 2, rl.RED)
+					rl.DrawLineEx(invalid_point + rl.Vector2{-10, 10}, invalid_point + rl.Vector2{10, -10}, 2, rl.RED)
 				}
 
 				particles.render_particles()
