@@ -104,9 +104,11 @@ find_unit :: proc(pos: vec2) -> Maybe(int) {
 	return nil
 }
 
+ignore_mouse := false
+
 mouse_pressed :: proc(button: rl.MouseButton, dt: f32) -> bool {
 	// hack to prevent double processing by checking that we're not in the same frame
-	return rl.IsMouseButtonPressed(button) && dt > 0
+	return rl.IsMouseButtonPressed(button) && dt > 0 && !ignore_mouse
 }
 
 key_pressed :: proc(button: rl.KeyboardKey, dt: f32) -> bool {
@@ -262,7 +264,13 @@ ctx: GameContext
 GRID_SIZE :: 64
 BACKGROUND_COLOR :: rl.Color{196, 168, 110, 255}
 
+UnitType :: enum {
+	WaterExtractor,
+	ElectrictyExtractor,
+}
+
 Unit :: struct {
+	type:        UnitType,
 	rect:        Rect,
 	snap_points: small_array.Small_Array(8, vec2),
 }
@@ -407,6 +415,37 @@ camera := rl.Camera2D {
 	zoom   = 1,
 }
 
+new_row :: proc(r: ^Rect, row_height: f32) -> Rect {
+	assert(row_height != 0)
+
+	height := row_height
+
+	if height > 0 {
+		defer r.y += height
+		return Rect{r.x, r.y, r.width, height}
+	} else {
+		height = -height
+		r.height -= height
+		return Rect{r.x, r.height, r.width, height}
+	}
+}
+
+new_col :: proc(r: ^Rect, col_width: f32) -> Rect {
+	assert(col_width != 0)
+
+	width := col_width
+
+	if width > 0 {
+		defer r.x += width
+		return Rect{r.x, r.y, width, r.height}
+	} else {
+		width = -width
+		defer r.width -= width
+		return Rect{r.width - width, r.y, width, r.height}
+	}
+}
+
+
 render_grid :: proc(mouse_pos: vec2, color: rl.Color) {
 	height := rl.GetRenderHeight()
 	width := rl.GetRenderWidth()
@@ -444,11 +483,6 @@ frame :: proc() {
 	// clear temp allocator each frame
 	defer free_all(context.temp_allocator)
 
-	dt := rl.GetFrameTime()
-
-	update_state(&ctx.ui_state, dt)
-	particles.update_systems(dt)
-
 	rl.BeginDrawing()
 	defer rl.EndDrawing()
 
@@ -461,7 +495,14 @@ frame :: proc() {
 			rl.ClearBackground(BACKGROUND_COLOR)
 			{
 				for unit in ctx.units {
-					rl.DrawRectangleRec(unit.rect, rl.GRAY)
+					color := rl.GRAY
+					switch unit.type {
+					case .ElectrictyExtractor:
+						color = rl.GOLD
+					case .WaterExtractor:
+						color = rl.DARKBLUE
+					}
+					rl.DrawRectangleRec(unit.rect, color)
 				}
 
 				if ctx.ui_state == .PlaceBuilding {
@@ -523,6 +564,34 @@ frame :: proc() {
 	}
 	rl.DrawFPS(500, 10)
 	rl.DrawText(fmt.ctprint(ctx.view_mode), 10, 10, 20, rl.WHITE)
+
+	if ctx.view_mode == .Above {
+		mouse_pos := rl.GetMousePosition()
+		if id, ok := find_unit(rl.GetScreenToWorld2D(mouse_pos, camera)).?; ok {
+			unit := ctx.units[id]
+			// print stats
+			rl.DrawTextEx(rl.GetFontDefault(), fmt.ctprint(unit.type), mouse_pos + vec2{40, 0}, 10, 1.0, rl.WHITE)
+		}
+
+		layout := Rect{0, 0, f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())}
+
+		row := new_row(&layout, -40)
+		ignore_mouse = rl.CheckCollisionPointRec(mouse_pos, row)
+		rl.DrawRectangleRec(row, rl.DARKGRAY)
+		if rl.GuiButton(new_col(&row, 120), "WaterExtractor") {
+			new_unit.type = .WaterExtractor
+		}
+		if rl.GuiButton(new_col(&row, 120), "ElectrictyExtractor") {
+			new_unit.type = .ElectrictyExtractor
+		}
+	}
+
+	dt := rl.GetFrameTime()
+
+
+	update_state(&ctx.ui_state, dt)
+	particles.update_systems(dt)
+
 }
 
 fini :: proc() {
