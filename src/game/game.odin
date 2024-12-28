@@ -2,10 +2,15 @@ package game
 
 import rl "../../raylib"
 
+import "core:container/intrusive/list"
+import "core:container/small_array"
 import "core:fmt"
 import "core:math"
 import "core:strings"
 import "particles"
+
+vec2 :: rl.Vector2
+Rect :: rl.Rectangle
 
 Transition :: enum {
 	Enter,
@@ -55,43 +60,61 @@ new_unit := Unit {
 }
 
 valid_placement := true
-invalid_point := rl.Vector2{}
-start_unit: Maybe(int) = 0
+invalid_point := vec2{}
+start_unit: Maybe(int) = nil
+end_unit: Maybe(int) = nil
 
-rect_edges :: proc(r: rl.Rectangle) -> [8]rl.Vector2 {
-	return [8]rl.Vector2 {
+rect_edges :: proc(r: Rect) -> [8]vec2 {
+	return [8]vec2 {
 		// top
-		rl.Vector2{r.x, r.y},
-		rl.Vector2{r.x + r.width, r.y},
+		vec2{r.x, r.y},
+		vec2{r.x + r.width, r.y},
 		// bottom
-		rl.Vector2{r.x, r.y + r.height},
-		rl.Vector2{r.x + r.width, r.y + r.height},
+		vec2{r.x, r.y + r.height},
+		vec2{r.x + r.width, r.y + r.height},
 		// left
-		rl.Vector2{r.x, r.y},
-		rl.Vector2{r.x, r.y + r.height},
+		vec2{r.x, r.y},
+		vec2{r.x, r.y + r.height},
 		// right
-		rl.Vector2{r.x + r.width, r.y},
-		rl.Vector2{r.x + r.width, r.y + r.height},
+		vec2{r.x + r.width, r.y},
+		vec2{r.x + r.width, r.y + r.height},
 	}
 }
 
 
 PipeConnection :: struct {
-	from:       uint,
-	to:         uint,
-	pipe_start: uint,
-	pipe_end:   uint,
+	from: int,
+	to:   int,
+	pipe: ^Pipe,
 }
-pipe_graph := make(map[uint][dynamic]PipeConnection)
-pipe_reset_len: Maybe(int) = nil
+pipe_graph := make(map[int][dynamic]PipeConnection)
+new_pipe: ^Pipe
 
-connect_units :: proc(from, to, pipe_start, pipe_end: uint) {
-	append(&pipe_graph[from], PipeConnection{from = from, to = to, pipe_start = pipe_start, pipe_end = pipe_end})
-	append(&pipe_graph[to], PipeConnection{from = to, to = from, pipe_start = pipe_start, pipe_end = pipe_end})
+connect_units :: proc(from, to: int, pipe: ^Pipe) {
+	append(&pipe_graph[from], PipeConnection{from = from, to = to, pipe = pipe})
+	append(&pipe_graph[to], PipeConnection{from = to, to = from, pipe = pipe})
+}
+
+find_unit :: proc(pos: vec2) -> Maybe(int) {
+	for unit, i in ctx.units {
+		if rl.CheckCollisionPointRec(pos, unit.rect) {
+			return i
+		}
+	}
+	return nil
+}
+
+mouse_pressed :: proc(button: rl.MouseButton, dt: f32) -> bool {
+	// hack to prevent double processing by checking that we're not in the same frame
+	return rl.IsMouseButtonPressed(button) && dt > 0
+}
+
+key_pressed :: proc(button: rl.KeyboardKey, dt: f32) -> bool {
+	return rl.IsKeyPressed(button) && dt > 0
 }
 
 handle_event :: proc(event: Event, dt: f32) -> State {
-	if event.transition == .Update && dt > 0 && rl.IsKeyPressed(.TAB) {
+	if event.transition == .Update && key_pressed(.TAB, dt) {
 		ctx.view_mode = ViewMode((int(ctx.view_mode) + 1) % len(ViewMode))
 		return .Idle
 	}
@@ -105,7 +128,7 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 		valid_placement = true
 
 	case Event{.Update, .Idle}:
-		if rl.IsMouseButtonPressed(.LEFT) && dt > 0 {
+		if mouse_pressed(.LEFT, dt) {
 			switch ctx.view_mode {
 			case .Above:
 				return .PlaceBuilding
@@ -122,7 +145,7 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 			valid_placement &= !rl.CheckCollisionRecs(new_unit.rect, unit.rect)
 		}
 
-		if valid_placement && rl.IsMouseButtonPressed(.LEFT) && dt > 0 {
+		if valid_placement && mouse_pressed(.LEFT, dt) {
 			append(&ctx.units, new_unit)
 			particles.create_system(
 				&new_unit.rect,
@@ -131,47 +154,48 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 				particle_lifetime = 0.6,
 			)
 		}
-		if rl.IsMouseButtonPressed(.RIGHT) {
+		if mouse_pressed(.RIGHT, dt) {
 			return .Idle
 		}
 	case Event{.Enter, .PlacePiping}:
-		start_unit = nil
-		for unit, i in ctx.units {
-			if rl.CheckCollisionPointRec(snap(pos), unit.rect) {
-				start_unit = i
-				break
-			}
-		}
-		if start_unit == nil {
+		snap_result, ok := find_closest_snap_point(pos).?
+		if !ok {
 			// cancel
 			return .Idle
 		}
-		pipe_reset_len = len(ctx.pipes)
+		start_unit = snap_result.unit_id
+		new_pipe = new(Pipe)
+		list.push_back(&ctx.pipes, new_pipe)
 
-		append(&ctx.pipes, snap(pos))
-		append(&ctx.pipes, pos)
+		append(&new_pipe.parts, snap_result.snap_point)
+		append(&new_pipe.parts, pos)
 	case Event{.Update, .PlacePiping}:
 		valid_placement = true
+		new_pipe.parts[len(new_pipe.parts) - 1] = snap(pos)
 
-		pipe_len := len(ctx.pipes) - pipe_reset_len.?
-		ctx.pipes[len(ctx.pipes) - 1] = snap(pos)
+		new_point_ptr := &new_pipe.parts[len(new_pipe.parts) - 1]
+		new_point := new_point_ptr^
+		prev_point := new_pipe.parts[len(new_pipe.parts) - 2]
 
-		for i in 1 ..< len(ctx.pipes) - 2 {
-			if ctx.pipes[i] == PIPE_END || ctx.pipes[i - 1] == PIPE_END {
+		iter := list.iterator_head(ctx.pipes, Pipe, "node")
+		for pipe in list.iterate_next(&iter) {
+			if pipe == new_pipe {
 				continue
 			}
 
-			valid_placement &= !rl.CheckCollisionLines(
-				ctx.pipes[i],
-				ctx.pipes[i - 1],
-				ctx.pipes[len(ctx.pipes) - 1],
-				ctx.pipes[len(ctx.pipes) - 2],
-				&invalid_point,
-			)
+			for i in 1 ..< len(pipe.parts) {
+				valid_placement &= !rl.CheckCollisionLines(
+					pipe.parts[i],
+					pipe.parts[i - 1],
+					new_point,
+					prev_point,
+					&invalid_point,
+				)
+			}
 		}
 
 		for unit, i in ctx.units {
-			if i == start_unit.? && pipe_len <= 2 {
+			if i == start_unit.? && len(new_pipe.parts) <= 2 {
 				continue
 			}
 			edges := rect_edges(unit.rect)
@@ -179,26 +203,54 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 				valid_placement &= !rl.CheckCollisionLines(
 					edges[j],
 					edges[j + 1],
-					ctx.pipes[len(ctx.pipes) - 1],
-					ctx.pipes[len(ctx.pipes) - 2],
+					new_point,
+					prev_point,
 					&invalid_point,
 				)
 			}
 		}
 
-		if rl.IsMouseButtonPressed(.LEFT) && valid_placement && dt > 0 {
-			append(&ctx.pipes, snap(pos))
+		if new_point == prev_point {
+			valid_placement = false
+			invalid_point = new_point
 		}
 
-		if rl.IsMouseButtonPressed(.RIGHT) {
-			// keep the pipe
-			pipe_reset_len = nil
-			ctx.pipes[len(ctx.pipes) - 1] = PIPE_END
+		end_unit = nil
+		if s, ok := find_closest_snap_point(new_point).?; ok {
+			if s.unit_id != start_unit {
+				// snap to end point
+				valid_placement = true
+				new_point_ptr^ = s.snap_point
+				end_unit = s.unit_id
+			} else {
+				valid_placement = false
+				invalid_point = s.snap_point
+			}
+		}
+
+		if mouse_pressed(.LEFT, dt) && valid_placement {
+			if _, ok := end_unit.?; ok {
+				return .Idle
+			} else {
+				append(&new_pipe.parts, snap(pos))
+			}
+		}
+
+		if mouse_pressed(.RIGHT, dt) || key_pressed(.ESCAPE, dt) {
 			return .Idle
 		}
+
+	//if rl.IsMouseButtonPressed(.RIGHT) {
+	//	// keep the pipe
+	//	pipe_reset_len = nil
+	//	ctx.pipes[len(ctx.pipes) - 1] = PIPE_END
+	//	return .Idle
+	//}
 	case Event{.Exit, .PlacePiping}:
-		if pipe_reset_len, ok := pipe_reset_len.?; ok {
-			resize(&ctx.pipes, pipe_reset_len)
+		if _, ok := end_unit.?; !ok {
+			list.pop_back(&ctx.pipes)
+		} else {
+			connect_units(start_unit.? or_else panic("unreachable"), end_unit.? or_else panic("unreachable"), new_pipe)
 		}
 	}
 
@@ -211,7 +263,8 @@ GRID_SIZE :: 64
 BACKGROUND_COLOR :: rl.Color{196, 168, 110, 255}
 
 Unit :: struct {
-	rect: rl.Rectangle,
+	rect:        Rect,
+	snap_points: small_array.Small_Array(8, vec2),
 }
 
 ViewMode :: enum {
@@ -219,20 +272,63 @@ ViewMode :: enum {
 	Below,
 }
 
-PIPE_END :: rl.Vector2{}
+Pipe :: struct {
+	parts:      [dynamic]vec2,
+	using node: list.Node,
+}
+
+PIPE_END :: vec2{}
 GameContext :: struct {
 	units:     [dynamic]Unit,
-	pipes:     [dynamic]rl.Vector2,
+	// list of Pipe
+	pipes:     list.List,
 	view_mode: ViewMode,
 	ui_state:  State,
 }
 
+rect_pos :: proc(r: Rect) -> vec2 {
+	return {r.x, r.y}
+}
+
+SnapResult :: struct {
+	snap_point: vec2,
+	unit_id:    int,
+}
+
+find_closest_snap_point :: proc(pos: vec2, max_dist: f32 = SNAP_RANGE) -> Maybe(SnapResult) {
+	closest_dist := math.INF_F32
+	closest_i := 0
+	closest_point := vec2{}
+
+	for &unit, i in ctx.units {
+		for snap_point in small_array.slice(&unit.snap_points) {
+			p := rect_pos(unit.rect) + snap_point
+			dist := rl.Vector2Length(pos - p)
+			if dist < closest_dist && dist < max_dist {
+				closest_dist = dist
+				closest_i = i
+				closest_point = p
+			}
+		}
+	}
+
+	if math.is_inf(closest_dist) {
+		return nil
+	} else {
+		return SnapResult{closest_point, closest_i}
+	}
+}
+
+SNAP_RANGE :: GRID_SIZE
 
 grid_target: rl.RenderTexture2D
 grid_shader: rl.Shader
 
 init :: proc() {
 	rl.SetTargetFPS(144)
+
+	// FIXME: for final release, set this
+	//rl.SetExitKey(.F4)
 
 	grid_target = rl.LoadRenderTexture(rl.GetRenderWidth(), rl.GetRenderHeight())
 
@@ -290,11 +386,19 @@ init :: proc() {
 
 	grid_shader = rl.LoadShaderFromMemory(nil, fmt.ctprint(shader_code))
 
+	small_array.append_elems(
+		&new_unit.snap_points,
+		vec2{0, GRID_SIZE},
+		vec2{new_unit.rect.width, GRID_SIZE},
+		vec2{GRID_SIZE, 0},
+		vec2{GRID_SIZE, new_unit.rect.height},
+	)
+
 	ctx.ui_state = .Idle
 }
 
-snap :: proc(pos: rl.Vector2) -> rl.Vector2 {
-	return rl.Vector2{math.floor(pos.x / GRID_SIZE) * GRID_SIZE, math.floor(pos.y / GRID_SIZE) * GRID_SIZE}
+snap :: proc(pos: vec2) -> vec2 {
+	return vec2{math.floor(pos.x / GRID_SIZE) * GRID_SIZE, math.floor(pos.y / GRID_SIZE) * GRID_SIZE}
 }
 
 camera := rl.Camera2D {
@@ -303,12 +407,12 @@ camera := rl.Camera2D {
 	zoom   = 1,
 }
 
-render_grid :: proc(mouse_pos: rl.Vector2, color: rl.Color) {
+render_grid :: proc(mouse_pos: vec2, color: rl.Color) {
 	height := rl.GetRenderHeight()
 	width := rl.GetRenderWidth()
 
 	loc := rl.GetShaderLocation(grid_shader, "pos")
-	pos := rl.Vector2{mouse_pos.x, f32(height) - mouse_pos.y}
+	pos := vec2{mouse_pos.x, f32(height) - mouse_pos.y}
 	rl.SetShaderValue(grid_shader, loc, &pos, rl.ShaderUniformDataType.VEC2)
 
 	rl.BeginTextureMode(grid_target)
@@ -373,36 +477,51 @@ frame :: proc() {
 			{
 				if ctx.ui_state == .PlacePiping {
 					render_grid(rl.GetMousePosition(), rl.GRAY)
+
 				}
 
 				for unit in ctx.units {
 					rl.DrawRectangleRec(unit.rect, rl.WHITE)
 				}
 
-				if len(ctx.pipes) > 1 {
-					for i in 1 ..< len(ctx.pipes) {
-						color := rl.RED if !valid_placement && i > pipe_reset_len.? else rl.WHITE
+				iter := list.iterator_head(ctx.pipes, Pipe, "node")
+				for pipe in list.iterate_next(&iter) {
+					for i in 1 ..< len(pipe.parts) {
+						color := rl.RED if !valid_placement && pipe == new_pipe else rl.WHITE
 						if i == 1 {
-							rl.DrawCircleV(ctx.pipes[0], 5, color)
+							rl.DrawCircleV(pipe.parts[0], 5, color)
 						}
-						if ctx.pipes[i] == PIPE_END || ctx.pipes[i - 1] == PIPE_END {
+						if pipe.parts[i] == PIPE_END || pipe.parts[i - 1] == PIPE_END {
 							continue
 						}
-						rl.DrawLineEx(ctx.pipes[i - 1], ctx.pipes[i], 10, color)
-						rl.DrawCircleV(ctx.pipes[i], 5, color)
+						rl.DrawLineEx(pipe.parts[i - 1], pipe.parts[i], 10, color)
+						rl.DrawCircleV(pipe.parts[i], 5, color)
 					}
 				}
 
-				// draw x indicator for intersectino
+				// draw x indicator for intersection
 				if !valid_placement {
-					rl.DrawLineEx(invalid_point + rl.Vector2{-10, -10}, invalid_point + rl.Vector2{10, 10}, 2, rl.RED)
-					rl.DrawLineEx(invalid_point + rl.Vector2{-10, 10}, invalid_point + rl.Vector2{10, -10}, 2, rl.RED)
+					rl.DrawLineEx(invalid_point + vec2{-10, -10}, invalid_point + vec2{10, 10}, 2, rl.RED)
+					rl.DrawLineEx(invalid_point + vec2{-10, 10}, invalid_point + vec2{10, -10}, 2, rl.RED)
+				}
+
+
+				for &unit in ctx.units {
+					for snap_point in small_array.slice(&unit.snap_points) {
+						p := snap_point + vec2{unit.rect.x, unit.rect.y}
+						rl.DrawCircleLinesV(p, 5, rl.GREEN)
+					}
+				}
+
+				if result, ok := find_closest_snap_point(rl.GetMousePosition()).?; ok {
+					rl.DrawCircleV(result.snap_point, 5, rl.LIME)
 				}
 
 				particles.render_particles()
 			}
 		}
 	}
+	rl.DrawFPS(500, 10)
 	rl.DrawText(fmt.ctprint(ctx.view_mode), 10, 10, 20, rl.WHITE)
 }
 
