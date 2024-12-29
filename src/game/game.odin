@@ -24,6 +24,7 @@ Rocks :: [][]vec2 {
 		{492.256, 157.41},
 	},
 	{{148.198, 121.495}, {96.796, 198.264}, {62.083, 151.535}, {81.442, 42.056}},
+	{{854.491, 282.402}, {1089.964, 340.687}, {889.463, 345.35}, {824.183, 389.647}},
 }
 
 //GooPools :: [][]vec2 {
@@ -35,7 +36,9 @@ GooPool :: struct {
 	size: f32,
 }
 
-goo_pools: [5]GooPool
+goo_pools: small_array.Small_Array(5, GooPool)
+next_spawn: f32 = 0
+GOO_POOL_SCALE_RATE :: 5
 
 Transition :: enum {
 	Enter,
@@ -97,13 +100,13 @@ create_unit :: proc(type: UnitType) -> Unit {
 
 	switch type {
 	case .GooExtractor:
-		u.goo_gen = 10
+		u.max_goo_gen = 10
 	case .GooTank:
 		u.goo_max = 100
 	case .Shipping:
 		u.goo_max = 10
 		u.startup_time = 10
-		u.goo_gen = -3
+		u.goo_use = 3
 	}
 	return u
 }
@@ -182,7 +185,8 @@ find_unit :: proc(pos: vec2) -> Maybe(int) {
 }
 
 ignore_mouse := false
-delete_pipe_event := false
+enter_delete_pipe := false
+enter_switch_view := false
 
 mouse_pressed :: proc(button: rl.MouseButton, dt: f32) -> bool {
 	// hack to prevent double processing by checking that we're not in the same frame
@@ -198,7 +202,8 @@ pad :: proc(rect: Rect, pad: f32) -> Rect {
 }
 
 handle_event :: proc(event: Event, dt: f32) -> State {
-	if event.transition == .Update && key_pressed(.TAB, dt) {
+	if event.transition == .Update && enter_switch_view {
+		enter_switch_view = false
 		ctx.view_mode = ViewMode((int(ctx.view_mode) + 1) % len(ViewMode))
 		return .Idle
 	}
@@ -221,8 +226,8 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 			}
 		}
 
-		if (delete_pipe_event) {
-			delete_pipe_event = false
+		if (enter_delete_pipe) {
+			enter_delete_pipe = false
 			return .DeletePiping
 		}
 	case Event{.Update, .PlaceBuilding}:
@@ -242,6 +247,36 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 				color = rl.Color{163, 106, 31, 100},
 				particle_lifetime = 0.6,
 			)
+
+			if new_unit.type in visible_underground {
+				// delete any underlying pipes
+				iter := list.iterator_head(ctx.pipes, Pipe, "node")
+				for pipe in list.iterate_next(&iter) {
+					delete := false
+					for i in 1 ..< len(pipe.parts) {
+						edges := rect_edges(new_unit.rect)
+						for j := 0; j < len(edges); j += 2 {
+							if rl.CheckCollisionLines(edges[j], edges[j + 1], pipe.parts[i], pipe.parts[i - 1], nil) {
+								delete = true
+								break
+							}
+						}
+					}
+
+					if (delete) {
+						particles.create_system(
+							&pipe.parts[0],
+							origin_distribution = particles.identity,
+							color = rl.GREEN,
+							particle_lifetime = 0.6,
+						)
+						list.remove(&ctx.pipes, pipe)
+						disconnect_units(pipe)
+						free(pipe)
+					}
+				}
+			}
+
 		}
 		if mouse_pressed(.RIGHT, dt) {
 			return .Idle
@@ -249,11 +284,13 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 	case Event{.Enter, .PlacePiping}:
 		snap_result, ok := find_closest_snap_point(pos).?
 		if !ok {
+			new_pipe = nil // ARAKLHRA
 			// cancel
 			return .Idle
 		}
 		start_unit = snap_result.unit_id
 		new_pipe = new(Pipe)
+		fmt.printf("new pipe %p\n", new_pipe)
 		list.push_back(&ctx.pipes, new_pipe)
 
 		append(&new_pipe.parts, snap_result.snap_point)
@@ -268,18 +305,22 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 
 		iter := list.iterator_head(ctx.pipes, Pipe, "node")
 		for pipe in list.iterate_next(&iter) {
-			if pipe == new_pipe {
-				continue
-			}
-
 			for i in 1 ..< len(pipe.parts) {
-				valid_placement &= !rl.CheckCollisionLines(
+				if pipe == new_pipe && i > len(pipe.parts) - 3 {
+					continue
+				}
+
+				pipe_collision := rl.CheckCollisionLines(
 					pipe.parts[i],
 					pipe.parts[i - 1],
 					new_point,
 					prev_point,
 					&invalid_point,
 				)
+				if pipe_collision && invalid_point != snap_pos {
+					valid_placement = false
+					break
+				}
 			}
 		}
 
@@ -290,13 +331,18 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 			edges := rect_edges(unit.rect)
 			for j := 0; j < len(edges); j += 2 {
 				if unit.type in visible_underground {
-					valid_placement &= !rl.CheckCollisionLines(
+					edge_collision := rl.CheckCollisionLines(
 						edges[j],
 						edges[j + 1],
 						new_point,
 						prev_point,
 						&invalid_point,
 					)
+
+					if edge_collision && invalid_point != snap_pos {
+						valid_placement = false
+						break
+					}
 				}
 			}
 		}
@@ -311,7 +357,7 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 		if s, ok := find_closest_snap_point(new_point).?; ok {
 			if s.unit_id != start_unit {
 				// snap to end point
-				valid_placement = true
+				valid_placement &= true
 				new_point_ptr^ = s.snap_point
 				end_unit = s.unit_id
 			} else {
@@ -331,7 +377,24 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 		}
 
 		if mouse_pressed(.RIGHT, dt) || key_pressed(.ESCAPE, dt) {
+			end_unit = nil
 			return .Idle
+		}
+	case Event{.Exit, .PlacePiping}:
+		if new_pipe != nil {
+			if _, ok := end_unit.?; !ok {
+				p := list.pop_back(&ctx.pipes)
+				assert(p == &new_pipe.node)
+				fmt.printf("free %p\n", new_pipe)
+				free(new_pipe)
+
+			} else {
+				connect_units(
+					start_unit.? or_else panic("unreachable"),
+					end_unit.? or_else panic("unreachable"),
+					new_pipe,
+				)
+			}
 		}
 
 	case Event{.Enter, .DeletePiping}:
@@ -345,6 +408,7 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 					if rl.CheckCollisionPointLine(mouse_pos_world, pipe.parts[i], pipe.parts[i - 1], 20) {
 						list.remove(&ctx.pipes, pipe)
 						disconnect_units(pipe)
+						free(pipe)
 					}
 				}
 			}
@@ -356,12 +420,6 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 	case Event{.Exit, .DeletePiping}:
 		rl.SetMouseCursor(.DEFAULT)
 
-	case Event{.Exit, .PlacePiping}:
-		if _, ok := end_unit.?; !ok {
-			list.pop_back(&ctx.pipes)
-		} else {
-			connect_units(start_unit.? or_else panic("unreachable"), end_unit.? or_else panic("unreachable"), new_pipe)
-		}
 	}
 
 	return .Undefined
@@ -386,6 +444,8 @@ Unit :: struct {
 	snap_points:  small_array.Small_Array(8, vec2),
 	goo_cur:      f32,
 	goo_gen:      f32,
+	goo_use:      f32,
+	max_goo_gen:  f32,
 	goo_max:      f32,
 	startup_time: f32,
 	rampup:       f32,
@@ -454,10 +514,6 @@ shipping_unit: ^Unit
 init :: proc() {
 	rl.SetTargetFPS(144)
 
-	screen_width := f32(rl.GetScreenWidth())
-	screen_height := f32(rl.GetScreenHeight())
-	goo_pools[0].pos = {rand.float32() * screen_width / 2 + screen_width / 2, rand.float32() * screen_height}
-	goo_pools[0].size = 100
 	// FIXME: for final release, set this
 	//rl.SetExitKey(.F4)
 
@@ -661,7 +717,7 @@ frame :: proc() {
 				}
 
 				{
-					for pool in goo_pools {
+					for pool in small_array.slice(&goo_pools) {
 						rl.DrawCircleLinesV(pool.pos, pool.size, rl.GREEN)
 					}
 				}
@@ -712,6 +768,15 @@ frame :: proc() {
 	rl.DrawText(fmt.ctprint(ctx.view_mode), 10, 30, 20, rl.WHITE)
 
 	mouse_pos := rl.GetMousePosition()
+
+	// draw button panel
+	layout := Rect{0, 0, f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())}
+
+	panel_row := new_row(&layout, -40)
+	ignore_mouse = rl.CheckCollisionPointRec(mouse_pos, panel_row)
+	rl.DrawRectangleRec(panel_row, rl.DARKGRAY)
+
+	enter_switch_view = rl.GuiButton(new_col(&panel_row, 180), "Switch View (tab)") || rl.IsKeyPressed(.TAB)
 	switch ctx.view_mode 
 	{
 	case .Above:
@@ -728,16 +793,6 @@ frame :: proc() {
 				rl.DrawTextEx(rl.GetFontDefault(), desc, mouse_pos + vec2{40, y}, 10, 1.0, rl.WHITE)
 				y += 20
 			}
-			if unit.goo_gen > 0 {
-				desc = fmt.ctprintf("Goo Outflow: %0.1f/s", unit.goo_gen)
-				rl.DrawTextEx(rl.GetFontDefault(), desc, mouse_pos + vec2{40, y}, 10, 1.0, rl.WHITE)
-				y += 20
-			}
-			if unit.goo_gen < 0 {
-				desc = fmt.ctprintf("Goo Usage: %0.1f/s", -unit.goo_gen)
-				rl.DrawTextEx(rl.GetFontDefault(), desc, mouse_pos + vec2{40, y}, 10, 1.0, rl.WHITE)
-				y += 20
-			}
 			if unit.rampup < unit.startup_time {
 				if unit.rampup == 0 {
 					rl.DrawTextEx(rl.GetFontDefault(), "INACTIVE", mouse_pos + vec2{40, y}, 10, 1.0, rl.LIGHTGRAY)
@@ -751,34 +806,31 @@ frame :: proc() {
 						rl.YELLOW,
 					)
 				}
+				y += 20
 			} else {
+				if unit.goo_gen > 0 {
+					desc = fmt.ctprintf("Goo Outflow: %0.1f/s", unit.goo_gen)
+					rl.DrawTextEx(rl.GetFontDefault(), desc, mouse_pos + vec2{40, y}, 10, 1.0, rl.WHITE)
+					y += 20
+				}
+				if unit.goo_use > 0 {
+					desc = fmt.ctprintf("Goo Usage: %0.1f/s", unit.goo_use)
+					rl.DrawTextEx(rl.GetFontDefault(), desc, mouse_pos + vec2{40, y}, 10, 1.0, rl.WHITE)
+					y += 20
+				}
 				rl.DrawTextEx(rl.GetFontDefault(), "ACTIVE", mouse_pos + vec2{40, y}, 10, 1.0, rl.GREEN)
+				y += 20
 			}
-			y += 20
 		}
 
-		layout := Rect{0, 0, f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())}
-
-		row := new_row(&layout, -40)
-		ignore_mouse = rl.CheckCollisionPointRec(mouse_pos, row)
-		rl.DrawRectangleRec(row, rl.DARKGRAY)
-
-		if rl.GuiButton(new_col(&row, 120), "GooExtractor") {
+		if rl.GuiButton(new_col(&panel_row, 120), "GooExtractor (1)") || rl.IsKeyPressed(.ONE) {
 			new_unit = create_unit(.GooExtractor)
 		}
-		if rl.GuiButton(new_col(&row, 120), "GooTank") {
+		if rl.GuiButton(new_col(&panel_row, 120), "GooTank (2)") || rl.IsKeyPressed(.TWO) {
 			new_unit = create_unit(.GooTank)
 		}
 	case .Below:
-		layout := Rect{0, 0, f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())}
-
-		row := new_row(&layout, -40)
-		ignore_mouse = rl.CheckCollisionPointRec(mouse_pos, row)
-		rl.DrawRectangleRec(row, rl.DARKGRAY)
-
-		if rl.GuiButton(new_col(&row, 120), "Delete Pipe") {
-			delete_pipe_event = true
-		}
+		enter_delete_pipe = rl.GuiButton(new_col(&panel_row, 120), "Delete Pipe (d)") || rl.IsKeyPressed(.D)
 	}
 
 	dt := rl.GetFrameTime()
@@ -792,7 +844,31 @@ frame :: proc() {
 		if unit.goo_cur == 0 {
 			unit.rampup = 0
 		}
-		unit.goo_cur = clamp(unit.goo_cur + unit.goo_gen * dt, 0, unit.goo_max)
+		if unit.type == .GooExtractor {
+			unit.goo_gen = 0
+			active := false
+			for i := 0; i < small_array.len(goo_pools); {
+				pool := small_array.get_ptr(&goo_pools, i)
+				dist := rl.Vector2Length(
+					pool.pos - vec2{unit.rect.x, unit.rect.y} + vec2{unit.rect.width, unit.rect.height} / 2,
+				)
+				if dist < 300 && unit.goo_gen < unit.max_goo_gen {
+					unit.goo_gen += min(1, pool.size / GOO_POOL_SCALE_RATE)
+					pool.size = clamp(pool.size - GOO_POOL_SCALE_RATE * dt, 0, pool.size)
+					active = true
+				}
+
+				if pool.size > 0 {
+					i += 1
+				} else {
+					small_array.unordered_remove(&goo_pools, i)
+				}
+			}
+			unit.startup_time = 0 if active else 1
+		} else {
+			unit.goo_gen = unit.max_goo_gen
+		}
+		unit.goo_cur = clamp(unit.goo_cur - unit.goo_use * dt, 0, unit.goo_max)
 	}
 
 	if shipping_unit.rampup >= shipping_unit.startup_time {
@@ -829,6 +905,25 @@ frame :: proc() {
 			}
 		}
 	}
+
+
+	spawn_pools: {
+		screen_width := f32(rl.GetScreenWidth())
+		screen_height := f32(rl.GetScreenHeight())
+		t := f32(rl.GetTime())
+		if t > next_spawn {
+			small_array.append(
+				&goo_pools,
+				GooPool {
+					pos = {rand.float32() * screen_width / 2 + screen_width / 2, rand.float32() * screen_height},
+					size = 100,
+				},
+			)
+			next_spawn =
+				t + rand.float32_range(f32(small_array.len(goo_pools) * 2), f32(small_array.len(goo_pools) * 4))
+		}
+	}
+
 	particles.update_systems(dt)
 }
 
