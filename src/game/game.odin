@@ -6,11 +6,36 @@ import "core:container/intrusive/list"
 import "core:container/small_array"
 import "core:fmt"
 import "core:math"
+import "core:math/rand"
 import "core:strings"
 import "particles"
 
 vec2 :: rl.Vector2
 Rect :: rl.Rectangle
+
+Rocks :: [][]vec2 {
+	{
+		{565.02, 208.144},
+		{566.355, 284.913},
+		{506.943, 369.693},
+		{486.248, 474.499},
+		{427.504, 380.374},
+		{482.911, 313.619},
+		{492.256, 157.41},
+	},
+	{{148.198, 121.495}, {96.796, 198.264}, {62.083, 151.535}, {81.442, 42.056}},
+}
+
+//GooPools :: [][]vec2 {
+//	{{1081.238, 477.464}, {1118.541, 547.406}, {1256.095, 505.441}, {1214.129, 409.853}, {1111.547, 398.196}},
+//}
+
+GooPool :: struct {
+	pos:  vec2,
+	size: f32,
+}
+
+goo_pools: [5]GooPool
 
 Transition :: enum {
 	Enter,
@@ -28,6 +53,7 @@ State :: enum {
 	Idle,
 	PlaceBuilding,
 	PlacePiping,
+	DeletePiping,
 }
 
 set_state_inner :: proc(state: ^State, new_state: State) {
@@ -55,10 +81,34 @@ update_state :: proc(state: ^State, dt: f32) {
 	assert(i != max_transitions)
 }
 
-new_unit := Unit {
-	rect = {-100, -100, GRID_SIZE * 2, GRID_SIZE * 2},
+create_unit :: proc(type: UnitType) -> Unit {
+	u := Unit {
+		type = type,
+		rect = Rect{0, 0, GRID_SIZE * 2, GRID_SIZE * 2},
+	}
+
+	small_array.append_elems(
+		&u.snap_points,
+		vec2{0, GRID_SIZE},
+		vec2{u.rect.width, GRID_SIZE},
+		vec2{GRID_SIZE, 0},
+		vec2{GRID_SIZE, u.rect.height},
+	)
+
+	switch type {
+	case .GooExtractor:
+		u.goo_gen = 10
+	case .GooTank:
+		u.goo_max = 100
+	case .Shipping:
+		u.goo_max = 10
+		u.startup_time = 10
+		u.goo_gen = -3
+	}
+	return u
 }
 
+new_unit: Unit
 valid_placement := true
 invalid_point := vec2{}
 start_unit: Maybe(int) = nil
@@ -91,8 +141,35 @@ pipe_graph := make(map[int][dynamic]PipeConnection)
 new_pipe: ^Pipe
 
 connect_units :: proc(from, to: int, pipe: ^Pipe) {
+	if !(from in pipe_graph) {
+		pipe_graph[from] = make([dynamic]PipeConnection)
+	}
+	if !(to in pipe_graph) {
+		pipe_graph[to] = make([dynamic]PipeConnection)
+	}
 	append(&pipe_graph[from], PipeConnection{from = from, to = to, pipe = pipe})
 	append(&pipe_graph[to], PipeConnection{from = to, to = from, pipe = pipe})
+}
+
+disconnect_units :: proc(pipe: ^Pipe) {
+	remove1, remove2 := false, false
+	for _, connections in pipe_graph {
+		for connection, i in connections {
+			if connection.pipe == pipe {
+				for connection2, j in pipe_graph[connection.to] {
+					if connection2.pipe == pipe {
+						unordered_remove(&pipe_graph[connection.to], j)
+						remove2 = true
+						break
+					}
+				}
+				unordered_remove(&pipe_graph[connection.from], i)
+				remove1 = true
+				break
+			}
+		}
+	}
+	assert(remove1 && remove2)
 }
 
 find_unit :: proc(pos: vec2) -> Maybe(int) {
@@ -105,6 +182,7 @@ find_unit :: proc(pos: vec2) -> Maybe(int) {
 }
 
 ignore_mouse := false
+delete_pipe_event := false
 
 mouse_pressed :: proc(button: rl.MouseButton, dt: f32) -> bool {
 	// hack to prevent double processing by checking that we're not in the same frame
@@ -113,6 +191,10 @@ mouse_pressed :: proc(button: rl.MouseButton, dt: f32) -> bool {
 
 key_pressed :: proc(button: rl.KeyboardKey, dt: f32) -> bool {
 	return rl.IsKeyPressed(button) && dt > 0
+}
+
+pad :: proc(rect: Rect, pad: f32) -> Rect {
+	return {rect.x - pad, rect.y - pad, rect.width + pad * 2, rect.height + pad * 2}
 }
 
 handle_event :: proc(event: Event, dt: f32) -> State {
@@ -138,13 +220,18 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 				return .PlacePiping
 			}
 		}
+
+		if (delete_pipe_event) {
+			delete_pipe_event = false
+			return .DeletePiping
+		}
 	case Event{.Update, .PlaceBuilding}:
 		assert(ctx.view_mode == .Above)
 		new_unit.rect.x = snap_pos.x
 		new_unit.rect.y = snap_pos.y
 		valid_placement = true
 		for unit in ctx.units {
-			valid_placement &= !rl.CheckCollisionRecs(new_unit.rect, unit.rect)
+			valid_placement &= !rl.CheckCollisionRecs(new_unit.rect, pad(unit.rect, GRID_SIZE))
 		}
 
 		if valid_placement && mouse_pressed(.LEFT, dt) {
@@ -202,19 +289,22 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 			}
 			edges := rect_edges(unit.rect)
 			for j := 0; j < len(edges); j += 2 {
-				valid_placement &= !rl.CheckCollisionLines(
-					edges[j],
-					edges[j + 1],
-					new_point,
-					prev_point,
-					&invalid_point,
-				)
+				if unit.type in visible_underground {
+					valid_placement &= !rl.CheckCollisionLines(
+						edges[j],
+						edges[j + 1],
+						new_point,
+						prev_point,
+						&invalid_point,
+					)
+				}
 			}
 		}
 
-		if new_point == prev_point {
-			valid_placement = false
-			invalid_point = new_point
+		for rock in Rocks {
+			for i in 1 ..< len(rock) {
+				valid_placement &= !rl.CheckCollisionLines(rock[i], rock[i - 1], new_point, prev_point, &invalid_point)
+			}
 		}
 
 		end_unit = nil
@@ -230,7 +320,9 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 			}
 		}
 
-		if mouse_pressed(.LEFT, dt) && valid_placement {
+
+		if mouse_pressed(.LEFT, dt) && valid_placement && new_point != prev_point {
+			new_pipe.length += rl.Vector2Length(new_point - prev_point) / GRID_SIZE
 			if _, ok := end_unit.?; ok {
 				return .Idle
 			} else {
@@ -242,12 +334,28 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 			return .Idle
 		}
 
-	//if rl.IsMouseButtonPressed(.RIGHT) {
-	//	// keep the pipe
-	//	pipe_reset_len = nil
-	//	ctx.pipes[len(ctx.pipes) - 1] = PIPE_END
-	//	return .Idle
-	//}
+	case Event{.Enter, .DeletePiping}:
+		rl.SetMouseCursor(.CROSSHAIR)
+	case Event{.Update, .DeletePiping}:
+		if mouse_pressed(.LEFT, dt) {
+			iter := list.iterator_head(ctx.pipes, Pipe, "node")
+			for pipe in list.iterate_next(&iter) {
+				for i in 1 ..< len(pipe.parts) {
+					mouse_pos_world := rl.GetScreenToWorld2D(pos, camera)
+					if rl.CheckCollisionPointLine(mouse_pos_world, pipe.parts[i], pipe.parts[i - 1], 20) {
+						list.remove(&ctx.pipes, pipe)
+						disconnect_units(pipe)
+					}
+				}
+			}
+		}
+
+		if mouse_pressed(.RIGHT, dt) || key_pressed(.ESCAPE, dt) {
+			return .Idle
+		}
+	case Event{.Exit, .DeletePiping}:
+		rl.SetMouseCursor(.DEFAULT)
+
 	case Event{.Exit, .PlacePiping}:
 		if _, ok := end_unit.?; !ok {
 			list.pop_back(&ctx.pipes)
@@ -265,14 +373,22 @@ GRID_SIZE :: 64
 BACKGROUND_COLOR :: rl.Color{196, 168, 110, 255}
 
 UnitType :: enum {
-	WaterExtractor,
-	ElectrictyExtractor,
+	GooExtractor,
+	GooTank,
+	Shipping,
 }
 
+visible_underground: bit_set[UnitType] = {.GooTank, .GooExtractor}
+
 Unit :: struct {
-	type:        UnitType,
-	rect:        Rect,
-	snap_points: small_array.Small_Array(8, vec2),
+	type:         UnitType,
+	rect:         Rect,
+	snap_points:  small_array.Small_Array(8, vec2),
+	goo_cur:      f32,
+	goo_gen:      f32,
+	goo_max:      f32,
+	startup_time: f32,
+	rampup:       f32,
 }
 
 ViewMode :: enum {
@@ -282,16 +398,17 @@ ViewMode :: enum {
 
 Pipe :: struct {
 	parts:      [dynamic]vec2,
+	length:     f32,
 	using node: list.Node,
 }
 
-PIPE_END :: vec2{}
 GameContext :: struct {
-	units:     [dynamic]Unit,
+	units:           [dynamic]Unit,
 	// list of Pipe
-	pipes:     list.List,
-	view_mode: ViewMode,
-	ui_state:  State,
+	pipes:           list.List,
+	view_mode:       ViewMode,
+	ui_state:        State,
+	barrels_shipped: f32,
 }
 
 rect_pos :: proc(r: Rect) -> vec2 {
@@ -332,9 +449,15 @@ SNAP_RANGE :: GRID_SIZE
 grid_target: rl.RenderTexture2D
 grid_shader: rl.Shader
 
+shipping_unit: ^Unit
+
 init :: proc() {
 	rl.SetTargetFPS(144)
 
+	screen_width := f32(rl.GetScreenWidth())
+	screen_height := f32(rl.GetScreenHeight())
+	goo_pools[0].pos = {rand.float32() * screen_width / 2 + screen_width / 2, rand.float32() * screen_height}
+	goo_pools[0].size = 100
 	// FIXME: for final release, set this
 	//rl.SetExitKey(.F4)
 
@@ -377,6 +500,14 @@ init :: proc() {
 	}
 	`
 
+	shipping := create_unit(.Shipping)
+	shipping.rect = Rect{GRID_SIZE, GRID_SIZE * 5, 2 * GRID_SIZE, GRID_SIZE}
+	small_array.resize(&shipping.snap_points, 0)
+	small_array.append_elems(&shipping.snap_points, vec2{GRID_SIZE, 0})
+	append(&ctx.units, shipping)
+	shipping_unit = &ctx.units[0]
+
+
 	shader_code, _ = strings.replace(
 		shader_code,
 		"%%WIDTH%%",
@@ -394,13 +525,7 @@ init :: proc() {
 
 	grid_shader = rl.LoadShaderFromMemory(nil, fmt.ctprint(shader_code))
 
-	small_array.append_elems(
-		&new_unit.snap_points,
-		vec2{0, GRID_SIZE},
-		vec2{new_unit.rect.width, GRID_SIZE},
-		vec2{GRID_SIZE, 0},
-		vec2{GRID_SIZE, new_unit.rect.height},
-	)
+	new_unit = create_unit(.GooExtractor)
 
 	ctx.ui_state = .Idle
 }
@@ -479,6 +604,19 @@ render_grid :: proc(mouse_pos: vec2, color: rl.Color) {
 	rl.EndBlendMode()
 }
 
+unit_color :: proc(type: UnitType) -> rl.Color {
+	color := rl.GRAY
+	switch type {
+	case .GooTank:
+		color = rl.GRAY
+	case .GooExtractor:
+		color = rl.DARKGREEN
+	case .Shipping:
+		color = rl.BROWN
+	}
+	return color
+}
+
 frame :: proc() {
 	// clear temp allocator each frame
 	defer free_all(context.temp_allocator)
@@ -495,14 +633,7 @@ frame :: proc() {
 			rl.ClearBackground(BACKGROUND_COLOR)
 			{
 				for unit in ctx.units {
-					color := rl.GRAY
-					switch unit.type {
-					case .ElectrictyExtractor:
-						color = rl.GOLD
-					case .WaterExtractor:
-						color = rl.DARKBLUE
-					}
-					rl.DrawRectangleRec(unit.rect, color)
+					rl.DrawRectangleRec(unit.rect, unit_color(unit.type))
 				}
 
 				if ctx.ui_state == .PlaceBuilding {
@@ -518,12 +649,29 @@ frame :: proc() {
 			{
 				if ctx.ui_state == .PlacePiping {
 					render_grid(rl.GetMousePosition(), rl.GRAY)
+				}
 
+				{
+					for rock in Rocks {
+						for i in 1 ..< len(rock) {
+							rl.DrawLineEx(rock[i - 1], rock[i], 3, rl.GRAY)
+						}
+						rl.DrawLineEx(rock[0], rock[len(rock) - 1], 3, rl.GRAY)
+					}
+				}
+
+				{
+					for pool in goo_pools {
+						rl.DrawCircleLinesV(pool.pos, pool.size, rl.GREEN)
+					}
 				}
 
 				for unit in ctx.units {
-					rl.DrawRectangleRec(unit.rect, rl.WHITE)
+					if unit.type in visible_underground {
+						rl.DrawRectangleLinesEx(unit.rect, 2, unit_color(unit.type))
+					}
 				}
+
 
 				iter := list.iterator_head(ctx.pipes, Pipe, "node")
 				for pipe in list.iterate_next(&iter) {
@@ -531,9 +679,6 @@ frame :: proc() {
 						color := rl.RED if !valid_placement && pipe == new_pipe else rl.WHITE
 						if i == 1 {
 							rl.DrawCircleV(pipe.parts[0], 5, color)
-						}
-						if pipe.parts[i] == PIPE_END || pipe.parts[i - 1] == PIPE_END {
-							continue
 						}
 						rl.DrawLineEx(pipe.parts[i - 1], pipe.parts[i], 10, color)
 						rl.DrawCircleV(pipe.parts[i], 5, color)
@@ -563,14 +708,53 @@ frame :: proc() {
 		}
 	}
 	rl.DrawFPS(500, 10)
-	rl.DrawText(fmt.ctprint(ctx.view_mode), 10, 10, 20, rl.WHITE)
+	rl.DrawText(fmt.ctprint("Barrels of Goo Shipped:", int(ctx.barrels_shipped)), 10, 10, 20, rl.GREEN)
+	rl.DrawText(fmt.ctprint(ctx.view_mode), 10, 30, 20, rl.WHITE)
 
-	if ctx.view_mode == .Above {
-		mouse_pos := rl.GetMousePosition()
+	mouse_pos := rl.GetMousePosition()
+	switch ctx.view_mode 
+	{
+	case .Above:
 		if id, ok := find_unit(rl.GetScreenToWorld2D(mouse_pos, camera)).?; ok {
+			rl.DrawRectangleRec(Rect{mouse_pos.x + 35, mouse_pos.y - 5, 140, 100}, rl.BLACK)
 			unit := ctx.units[id]
+			y: f32 = 0
 			// print stats
-			rl.DrawTextEx(rl.GetFontDefault(), fmt.ctprint(unit.type), mouse_pos + vec2{40, 0}, 10, 1.0, rl.WHITE)
+			rl.DrawTextEx(rl.GetFontDefault(), fmt.ctprint(unit.type), mouse_pos + vec2{40, y}, 10, 1.0, rl.WHITE)
+			y += 20
+			desc := cstring("")
+			if unit.goo_max > 0 {
+				desc = fmt.ctprintf("Goo Store: %0.1f/%0.1f", unit.goo_cur, unit.goo_max)
+				rl.DrawTextEx(rl.GetFontDefault(), desc, mouse_pos + vec2{40, y}, 10, 1.0, rl.WHITE)
+				y += 20
+			}
+			if unit.goo_gen > 0 {
+				desc = fmt.ctprintf("Goo Outflow: %0.1f/s", unit.goo_gen)
+				rl.DrawTextEx(rl.GetFontDefault(), desc, mouse_pos + vec2{40, y}, 10, 1.0, rl.WHITE)
+				y += 20
+			}
+			if unit.goo_gen < 0 {
+				desc = fmt.ctprintf("Goo Usage: %0.1f/s", -unit.goo_gen)
+				rl.DrawTextEx(rl.GetFontDefault(), desc, mouse_pos + vec2{40, y}, 10, 1.0, rl.WHITE)
+				y += 20
+			}
+			if unit.rampup < unit.startup_time {
+				if unit.rampup == 0 {
+					rl.DrawTextEx(rl.GetFontDefault(), "INACTIVE", mouse_pos + vec2{40, y}, 10, 1.0, rl.LIGHTGRAY)
+				} else {
+					rl.DrawTextEx(
+						rl.GetFontDefault(),
+						fmt.ctprintf("STARTING: %0.1f%%", unit.rampup * 100 / unit.startup_time),
+						mouse_pos + vec2{40, y},
+						10,
+						1.0,
+						rl.YELLOW,
+					)
+				}
+			} else {
+				rl.DrawTextEx(rl.GetFontDefault(), "ACTIVE", mouse_pos + vec2{40, y}, 10, 1.0, rl.GREEN)
+			}
+			y += 20
 		}
 
 		layout := Rect{0, 0, f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())}
@@ -578,20 +762,74 @@ frame :: proc() {
 		row := new_row(&layout, -40)
 		ignore_mouse = rl.CheckCollisionPointRec(mouse_pos, row)
 		rl.DrawRectangleRec(row, rl.DARKGRAY)
-		if rl.GuiButton(new_col(&row, 120), "WaterExtractor") {
-			new_unit.type = .WaterExtractor
+
+		if rl.GuiButton(new_col(&row, 120), "GooExtractor") {
+			new_unit = create_unit(.GooExtractor)
 		}
-		if rl.GuiButton(new_col(&row, 120), "ElectrictyExtractor") {
-			new_unit.type = .ElectrictyExtractor
+		if rl.GuiButton(new_col(&row, 120), "GooTank") {
+			new_unit = create_unit(.GooTank)
+		}
+	case .Below:
+		layout := Rect{0, 0, f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())}
+
+		row := new_row(&layout, -40)
+		ignore_mouse = rl.CheckCollisionPointRec(mouse_pos, row)
+		rl.DrawRectangleRec(row, rl.DARKGRAY)
+
+		if rl.GuiButton(new_col(&row, 120), "Delete Pipe") {
+			delete_pipe_event = true
 		}
 	}
 
 	dt := rl.GetFrameTime()
 
-
 	update_state(&ctx.ui_state, dt)
-	particles.update_systems(dt)
 
+	for &unit in ctx.units {
+		if unit.rampup < unit.startup_time && unit.goo_cur > 0 {
+			unit.rampup += dt
+		}
+		if unit.goo_cur == 0 {
+			unit.rampup = 0
+		}
+		unit.goo_cur = clamp(unit.goo_cur + unit.goo_gen * dt, 0, unit.goo_max)
+	}
+
+	if shipping_unit.rampup >= shipping_unit.startup_time {
+		ctx.barrels_shipped += dt / 10
+	}
+
+	{
+		processed := make(map[^Pipe]bool, allocator = context.temp_allocator)
+
+		// process pipes
+		for _, connections in pipe_graph {
+			for connection in connections {
+				if connection.pipe in processed {
+					continue
+				}
+				processed[connection.pipe] = true
+
+				{
+					from_ptr := &ctx.units[connection.from]
+					to_ptr := &ctx.units[connection.to]
+
+					// flow of goo storage
+					dP: f32 = 0
+					if from_ptr.goo_gen == 0 && to_ptr.goo_gen == 0 {
+						dP = (1 * (from_ptr.goo_cur - to_ptr.goo_cur))
+					}
+
+					from_dP := (-dP + max(0, to_ptr.goo_gen - from_ptr.goo_gen)) / connection.pipe.length * dt
+					to_dP := (dP + max(0, from_ptr.goo_gen - to_ptr.goo_gen)) / connection.pipe.length * dt
+
+					from_ptr.goo_cur = clamp(from_ptr.goo_cur + from_dP, 0, from_ptr.goo_max)
+					to_ptr.goo_cur = clamp(to_ptr.goo_cur + to_dP, 0, to_ptr.goo_max)
+				}
+			}
+		}
+	}
+	particles.update_systems(dt)
 }
 
 fini :: proc() {
