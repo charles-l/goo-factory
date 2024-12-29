@@ -409,6 +409,7 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 						list.remove(&ctx.pipes, pipe)
 						disconnect_units(pipe)
 						free(pipe)
+						break
 					}
 				}
 			}
