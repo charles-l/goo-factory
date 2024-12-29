@@ -5,6 +5,7 @@ import rl "../../raylib"
 import "core:container/intrusive/list"
 import "core:container/small_array"
 import "core:fmt"
+import "core:log"
 import "core:math"
 import "core:math/rand"
 import "core:strings"
@@ -53,10 +54,12 @@ Event :: struct {
 
 State :: enum {
 	Undefined = 0,
+	Start,
 	Idle,
 	PlaceBuilding,
 	PlacePiping,
 	DeletePiping,
+	Win,
 }
 
 set_state_inner :: proc(state: ^State, new_state: State) {
@@ -101,12 +104,18 @@ create_unit :: proc(type: UnitType) -> Unit {
 	switch type {
 	case .GooExtractor:
 		u.max_goo_gen = 10
+		u.goo_max = 10
 	case .GooTank:
 		u.goo_max = 100
-	case .Shipping:
+	case .GooRefinery:
+		u.goo_use = 2
+		u.goo_max = 10
+		u.startup_time = 5
+		u.refine_goo = 0.5
+	case .GooShipping:
 		u.goo_max = 10
 		u.startup_time = 10
-		u.goo_use = 3
+		u.goo_use = 1
 	}
 	return u
 }
@@ -134,6 +143,8 @@ rect_edges :: proc(r: Rect) -> [8]vec2 {
 	}
 }
 
+sounds: map[string]rl.Sound
+textures: map[string]rl.Texture
 
 PipeConnection :: struct {
 	from: int,
@@ -187,6 +198,8 @@ find_unit :: proc(pos: vec2) -> Maybe(int) {
 ignore_mouse := false
 enter_delete_pipe := false
 enter_switch_view := false
+enter_place_unit := false
+show_shop_view := false
 
 mouse_pressed :: proc(button: rl.MouseButton, dt: f32) -> bool {
 	// hack to prevent double processing by checking that we're not in the same frame
@@ -208,13 +221,22 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 		return .Idle
 	}
 
+	if dt > 0 && ctx.refined_barrels_shipped > 10 {
+		return .Win
+	}
+
 	pos := rl.GetMousePosition()
 	snap_pos := snap(pos)
 
 	switch event {
+	case Event{.Update, .Start}:
+		if mouse_pressed(.LEFT, dt) {
+			return .Idle
+		}
 	case Event{.Enter, .Idle}:
 		// hide invalid marking placements
 		valid_placement = true
+
 
 	case Event{.Update, .Idle}:
 		if mouse_pressed(.LEFT, dt) {
@@ -226,7 +248,12 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 			}
 		}
 
-		if (enter_delete_pipe) {
+		if enter_place_unit {
+			enter_place_unit = false
+			return .PlaceBuilding
+		}
+
+		if enter_delete_pipe {
 			enter_delete_pipe = false
 			return .DeletePiping
 		}
@@ -247,6 +274,8 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 				color = rl.Color{163, 106, 31, 100},
 				particle_lifetime = 0.6,
 			)
+
+			rl.PlaySound(sounds["build"])
 
 			if new_unit.type in visible_underground {
 				// delete any underlying pipes
@@ -270,9 +299,16 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 							color = rl.GREEN,
 							particle_lifetime = 0.6,
 						)
+						particles.create_system(
+							&pipe.parts[len(pipe.parts) - 1],
+							origin_distribution = particles.identity,
+							color = rl.GREEN,
+							particle_lifetime = 0.6,
+						)
 						list.remove(&ctx.pipes, pipe)
 						disconnect_units(pipe)
 						free(pipe)
+						rl.PlaySound(sounds["explosion"])
 					}
 				}
 			}
@@ -284,13 +320,13 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 	case Event{.Enter, .PlacePiping}:
 		snap_result, ok := find_closest_snap_point(pos).?
 		if !ok {
-			new_pipe = nil // ARAKLHRA
+			new_pipe = nil // BLKAHSDF
 			// cancel
 			return .Idle
 		}
+		rl.PlaySound(sounds["click"])
 		start_unit = snap_result.unit_id
 		new_pipe = new(Pipe)
-		fmt.printf("new pipe %p\n", new_pipe)
 		list.push_back(&ctx.pipes, new_pipe)
 
 		append(&new_pipe.parts, snap_result.snap_point)
@@ -368,6 +404,7 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 
 
 		if mouse_pressed(.LEFT, dt) && valid_placement && new_point != prev_point {
+			rl.PlaySound(sounds["click"])
 			new_pipe.length += rl.Vector2Length(new_point - prev_point) / GRID_SIZE
 			if _, ok := end_unit.?; ok {
 				return .Idle
@@ -385,7 +422,6 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 			if _, ok := end_unit.?; !ok {
 				p := list.pop_back(&ctx.pipes)
 				assert(p == &new_pipe.node)
-				fmt.printf("free %p\n", new_pipe)
 				free(new_pipe)
 
 			} else {
@@ -400,6 +436,7 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 	case Event{.Enter, .DeletePiping}:
 		rl.SetMouseCursor(.CROSSHAIR)
 	case Event{.Update, .DeletePiping}:
+		assert(ctx.view_mode == .Below)
 		if mouse_pressed(.LEFT, dt) {
 			iter := list.iterator_head(ctx.pipes, Pipe, "node")
 			for pipe in list.iterate_next(&iter) {
@@ -409,6 +446,7 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 						list.remove(&ctx.pipes, pipe)
 						disconnect_units(pipe)
 						free(pipe)
+						rl.PlaySound(sounds["explosion"])
 						break
 					}
 				}
@@ -420,6 +458,9 @@ handle_event :: proc(event: Event, dt: f32) -> State {
 		}
 	case Event{.Exit, .DeletePiping}:
 		rl.SetMouseCursor(.DEFAULT)
+
+	case Event{.Enter, .Win}:
+		rl.PlaySound(sounds["victory"])
 
 	}
 
@@ -434,10 +475,12 @@ BACKGROUND_COLOR :: rl.Color{196, 168, 110, 255}
 UnitType :: enum {
 	GooExtractor,
 	GooTank,
-	Shipping,
+	GooRefinery,
+	GooShipping,
 }
 
 visible_underground: bit_set[UnitType] = {.GooTank, .GooExtractor}
+available_units: bit_set[UnitType] = {.GooTank, .GooExtractor}
 
 Unit :: struct {
 	type:         UnitType,
@@ -446,6 +489,7 @@ Unit :: struct {
 	goo_cur:      f32,
 	goo_gen:      f32,
 	goo_use:      f32,
+	refine_goo:   f32,
 	max_goo_gen:  f32,
 	goo_max:      f32,
 	startup_time: f32,
@@ -464,12 +508,13 @@ Pipe :: struct {
 }
 
 GameContext :: struct {
-	units:           [dynamic]Unit,
+	units:                   [dynamic]Unit,
 	// list of Pipe
-	pipes:           list.List,
-	view_mode:       ViewMode,
-	ui_state:        State,
-	barrels_shipped: f32,
+	pipes:                   list.List,
+	view_mode:               ViewMode,
+	ui_state:                State,
+	barrels_shipped:         f32,
+	refined_barrels_shipped: f32,
 }
 
 rect_pos :: proc(r: Rect) -> vec2 {
@@ -511,14 +556,36 @@ grid_target: rl.RenderTexture2D
 grid_shader: rl.Shader
 
 shipping_unit: ^Unit
+wind_loop: rl.Music
 
 init :: proc() {
+	log.info("init")
+	sounds = make(map[string]rl.Sound)
+	textures = make(map[string]rl.Texture)
 	rl.SetTargetFPS(144)
+	wind_loop = rl.LoadMusicStream("assets/windloop.ogg")
+	rl.SetMusicVolume(wind_loop, 0.4)
+	rl.PlayMusicStream(wind_loop)
+
+
+	sounds["build"] = rl.LoadSound("assets/build.wav")
+	sounds["click"] = rl.LoadSound("assets/click.wav")
+	sounds["explosion"] = rl.LoadSound("assets/explosion.wav")
+	sounds["barrel"] = rl.LoadSound("assets/barrel.wav")
+	sounds["victory"] = rl.LoadSound("assets/victory.wav")
+	log.warn("HIII")
+
+	textures["extractor"] = rl.LoadTexture("assets/extractor.png")
+	textures["refinery"] = rl.LoadTexture("assets/refinery.png")
+	textures["shipping"] = rl.LoadTexture("assets/shipment.png")
+	textures["tank"] = rl.LoadTexture("assets/tank.png")
 
 	// FIXME: for final release, set this
 	//rl.SetExitKey(.F4)
 
 	grid_target = rl.LoadRenderTexture(rl.GetRenderWidth(), rl.GetRenderHeight())
+
+	ctx.ui_state = .Start
 
 	shader_code := `#version 330
 
@@ -557,7 +624,7 @@ init :: proc() {
 	}
 	`
 
-	shipping := create_unit(.Shipping)
+	shipping := create_unit(.GooShipping)
 	shipping.rect = Rect{GRID_SIZE, GRID_SIZE * 5, 2 * GRID_SIZE, GRID_SIZE}
 	small_array.resize(&shipping.snap_points, 0)
 	small_array.append_elems(&shipping.snap_points, vec2{GRID_SIZE, 0})
@@ -584,7 +651,8 @@ init :: proc() {
 
 	new_unit = create_unit(.GooExtractor)
 
-	ctx.ui_state = .Idle
+	ctx.ui_state = .Start
+	log.info("init done")
 }
 
 snap :: proc(pos: vec2) -> vec2 {
@@ -661,6 +729,20 @@ render_grid :: proc(mouse_pos: vec2, color: rl.Color) {
 	rl.EndBlendMode()
 }
 
+unit_texture :: proc(type: UnitType) -> rl.Texture {
+	switch type {
+	case .GooTank:
+		return textures["tank"]
+	case .GooExtractor:
+		return textures["extractor"]
+	case .GooRefinery:
+		return textures["refinery"]
+	case .GooShipping:
+		return textures["shipping"]
+	}
+	return textures["extractor"]
+}
+
 unit_color :: proc(type: UnitType) -> rl.Color {
 	color := rl.GRAY
 	switch type {
@@ -668,13 +750,16 @@ unit_color :: proc(type: UnitType) -> rl.Color {
 		color = rl.GRAY
 	case .GooExtractor:
 		color = rl.DARKGREEN
-	case .Shipping:
+	case .GooRefinery:
+		color = rl.PURPLE
+	case .GooShipping:
 		color = rl.BROWN
 	}
 	return color
 }
 
 frame :: proc() {
+	rl.UpdateMusicStream(wind_loop)
 	// clear temp allocator each frame
 	defer free_all(context.temp_allocator)
 
@@ -690,13 +775,31 @@ frame :: proc() {
 			rl.ClearBackground(BACKGROUND_COLOR)
 			{
 				for unit in ctx.units {
-					rl.DrawRectangleRec(unit.rect, unit_color(unit.type))
+					tex := unit_texture(unit.type)
+					rl.DrawTexturePro(
+						tex,
+						{0, 0, f32(tex.width), f32(tex.height)},
+						unit.rect,
+						{0, 0},
+						0,
+						unit_color(unit.type),
+					)
 				}
 
 				if ctx.ui_state == .PlaceBuilding {
 					render_grid(rl.GetMousePosition(), rl.RED)
 
 					rl.DrawRectangleRec(new_unit.rect, rl.Fade(rl.GRAY if valid_placement else rl.RED, 0.5))
+
+					tex := unit_texture(new_unit.type)
+					rl.DrawTexturePro(
+						tex,
+						{0, 0, f32(tex.width), f32(tex.height)},
+						new_unit.rect,
+						{0, 0},
+						0,
+						unit_color(new_unit.type),
+					)
 				}
 
 				particles.render_particles()
@@ -764,9 +867,22 @@ frame :: proc() {
 			}
 		}
 	}
-	rl.DrawFPS(500, 10)
-	rl.DrawText(fmt.ctprint("Barrels of Goo Shipped:", int(ctx.barrels_shipped)), 10, 10, 20, rl.GREEN)
-	rl.DrawText(fmt.ctprint(ctx.view_mode), 10, 30, 20, rl.WHITE)
+	y: i32 = 10
+	rl.DrawRectangleRec({0, 0, 300, 30}, rl.BLACK)
+	rl.DrawText(fmt.ctprint("Barrels of Crude Goo:", int(ctx.barrels_shipped)), 10, y, 20, rl.GREEN)
+	y += 25
+	if UnitType.GooRefinery in available_units {
+		rl.DrawRectangleRec({0, f32(y) - 5, 400, 30}, rl.BLACK)
+		rl.DrawText(
+			fmt.ctprint("Barrels of Refined Goo Shipped:", int(ctx.refined_barrels_shipped)),
+			10,
+			y,
+			20,
+			rl.PURPLE,
+		)
+		y += 25
+	}
+	rl.DrawText(fmt.ctprint(ctx.view_mode), 10, y, 20, rl.WHITE)
 
 	mouse_pos := rl.GetMousePosition()
 
@@ -778,6 +894,9 @@ frame :: proc() {
 	rl.DrawRectangleRec(panel_row, rl.DARKGRAY)
 
 	enter_switch_view = rl.GuiButton(new_col(&panel_row, 180), "Switch View (tab)") || rl.IsKeyPressed(.TAB)
+	if (rl.GuiButton(new_col(&panel_row, 180), "Shop (s)") || rl.IsKeyPressed(.S)) {
+		show_shop_view = !show_shop_view
+	}
 	switch ctx.view_mode 
 	{
 	case .Above:
@@ -810,7 +929,7 @@ frame :: proc() {
 				y += 20
 			} else {
 				if unit.goo_gen > 0 {
-					desc = fmt.ctprintf("Goo Outflow: %0.1f/s", unit.goo_gen)
+					desc = fmt.ctprintf("Goo Extraction: %0.1f/s", unit.goo_gen)
 					rl.DrawTextEx(rl.GetFontDefault(), desc, mouse_pos + vec2{40, y}, 10, 1.0, rl.WHITE)
 					y += 20
 				}
@@ -824,14 +943,73 @@ frame :: proc() {
 			}
 		}
 
-		if rl.GuiButton(new_col(&panel_row, 120), "GooExtractor (1)") || rl.IsKeyPressed(.ONE) {
-			new_unit = create_unit(.GooExtractor)
-		}
-		if rl.GuiButton(new_col(&panel_row, 120), "GooTank (2)") || rl.IsKeyPressed(.TWO) {
-			new_unit = create_unit(.GooTank)
+		base_key :: rl.KeyboardKey.ONE
+		i := 0
+		enter_place_unit = false
+		for t := UnitType.GooExtractor; t <= UnitType.GooShipping; t = UnitType(int(t) + 1) {
+			if t not_in available_units {
+				continue
+			}
+			if rl.GuiButton(new_col(&panel_row, 120), fmt.ctprintf("%v (%d)", t, i + 1)) ||
+			   rl.IsKeyPressed(rl.KeyboardKey(int(base_key) + i)) {
+				new_unit = create_unit(t)
+				enter_place_unit = true
+			}
+			i += 1
 		}
 	case .Below:
 		enter_delete_pipe = rl.GuiButton(new_col(&panel_row, 120), "Delete Pipe (d)") || rl.IsKeyPressed(.D)
+	}
+
+	if show_shop_view {
+		center := vec2{f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())} / 2
+		shop_rect := Rect{center.x - 300, center.y - 200, 600, 400}
+		ignore_mouse |= rl.CheckCollisionPointRec(mouse_pos, shop_rect)
+
+		rl.GuiPanel(shop_rect, "Shop")
+
+		shop_rect = pad(shop_rect, -30)
+		shop_rect = new_row(&shop_rect, 60)
+
+		show_popup := false
+		for t := UnitType.GooExtractor; t < UnitType.GooShipping; t = UnitType(int(t) + 1) {
+			if t in available_units {
+				continue
+			}
+			button_rect := new_col(&shop_rect, 120)
+			text := fmt.ctprintf("Buy %v", t)
+			if ctx.barrels_shipped >= 5 {
+				if rl.GuiButton(button_rect, text) {
+					available_units += {t}
+				}
+			} else {
+				rl.DrawRectangleRec(button_rect, rl.LIGHTGRAY)
+				text_width := f32(rl.MeasureText(text, 10))
+				rl.DrawTextEx(
+					rl.GetFontDefault(),
+					text,
+					vec2{button_rect.x, button_rect.y} +
+					vec2{button_rect.width, button_rect.height} / 2 -
+					{text_width / 2, 5},
+					10,
+					1,
+					rl.WHITE,
+				)
+			}
+			if rl.CheckCollisionPointRec(mouse_pos, button_rect) {
+				show_popup = true
+			}
+		}
+
+		if rl.GuiButton(new_col(&shop_rect, 120), "Exit shop") {
+			show_shop_view = false
+		}
+
+		if show_popup {
+			rl.DrawRectangleV(mouse_pos + {10, 0}, {180, 20}, rl.BLACK)
+			rl.DrawTextEx(rl.GetFontDefault(), "Cost: 5 barrels of", mouse_pos + {10, 0}, 10, 1, rl.WHITE)
+			rl.DrawTextEx(rl.GetFontDefault(), "Crude Goo", mouse_pos + {120, 0}, 10, 1, rl.GREEN)
+		}
 	}
 
 	dt := rl.GetFrameTime()
@@ -866,20 +1044,25 @@ frame :: proc() {
 				}
 			}
 			unit.startup_time = 0 if active else 1
-		} else {
-			unit.goo_gen = unit.max_goo_gen
 		}
-		unit.goo_cur = clamp(unit.goo_cur - unit.goo_use * dt, 0, unit.goo_max)
+		unit.goo_cur = clamp(unit.goo_cur + (unit.goo_gen - unit.goo_use) * dt, 0, unit.goo_max)
+		if unit.refine_goo > 0 && unit.goo_cur > 0 {
+			ctx.refined_barrels_shipped += dt / 5
+		}
 	}
 
 	if shipping_unit.rampup >= shipping_unit.startup_time {
 		ctx.barrels_shipped += dt / 10
 	}
 
-	{
+	if int(ctx.refined_barrels_shipped - dt) != int(ctx.refined_barrels_shipped) ||
+	   int(ctx.barrels_shipped - dt) != int(ctx.barrels_shipped) {
+		rl.PlaySound(sounds["barrel"])
+	}
+
+	process_pipes: {
 		processed := make(map[^Pipe]bool, allocator = context.temp_allocator)
 
-		// process pipes
 		for _, connections in pipe_graph {
 			for connection in connections {
 				if connection.pipe in processed {
@@ -893,12 +1076,12 @@ frame :: proc() {
 
 					// flow of goo storage
 					dP: f32 = 0
-					if from_ptr.goo_gen == 0 && to_ptr.goo_gen == 0 {
-						dP = (1 * (from_ptr.goo_cur - to_ptr.goo_cur))
-					}
+					//if from_ptr.goo_gen == 0 && to_ptr.goo_gen == 0 {
+					dP = (1 * (from_ptr.goo_cur - to_ptr.goo_cur)) * 0.7
+					//}
 
-					from_dP := (-dP + max(0, to_ptr.goo_gen - from_ptr.goo_gen)) / connection.pipe.length * dt
-					to_dP := (dP + max(0, from_ptr.goo_gen - to_ptr.goo_gen)) / connection.pipe.length * dt
+					from_dP := -dP //(-dP + max(0, to_ptr.goo_gen - from_ptr.goo_gen)) // / connection.pipe.length * dt
+					to_dP := dP //(dP + max(0, from_ptr.goo_gen - to_ptr.goo_gen)) // / connection.pipe.length * dt
 
 					from_ptr.goo_cur = clamp(from_ptr.goo_cur + from_dP, 0, from_ptr.goo_max)
 					to_ptr.goo_cur = clamp(to_ptr.goo_cur + to_dP, 0, to_ptr.goo_max)
@@ -926,6 +1109,33 @@ frame :: proc() {
 	}
 
 	particles.update_systems(dt)
+
+	if ctx.ui_state == .Start {
+		rl.DrawRectangle(0, 0, rl.GetScreenWidth(), rl.GetScreenHeight() / 2, rl.BLACK)
+		DrawTextCentered("Objective: Ship 10 barrels of Refined Goo", f32(rl.GetScreenWidth() / 2), 40, 40, rl.PURPLE)
+	}
+
+	if ctx.ui_state == .Win {
+		rl.DrawRectangle(0, 0, rl.GetScreenWidth(), rl.GetScreenHeight(), rl.BLACK)
+		DrawTextCentered("Victory!", f32(rl.GetScreenWidth() / 2), f32(rl.GetScreenHeight() / 2 - 40), 40)
+		DrawTextCentered(
+			"You've successfully became the Goo Baron",
+			f32(rl.GetScreenWidth() / 2),
+			f32(rl.GetScreenHeight() / 2),
+			40,
+			color = rl.PURPLE,
+		)
+	}
+
+	if rl.IsKeyPressed(.PERIOD) {
+		ctx.barrels_shipped += 1
+	}
+
+}
+
+DrawTextCentered :: proc(text: cstring, x: f32, y: f32, size: i32, color: rl.Color = rl.WHITE) {
+	text_width := f32(rl.MeasureText(text, size))
+	rl.DrawTextEx(rl.GetFontDefault(), text, vec2{x, y} - {text_width / 2, f32(size / 2)}, f32(size), 2, color)
 }
 
 fini :: proc() {
