@@ -587,26 +587,52 @@ init :: proc() {
 
 	ctx.ui_state = .Start
 
-	shader_code := `#version 330
+	vertex_code := `#version 100
+
+	// Input vertex attributes
+	attribute vec3 vertexPosition;
+	attribute vec2 vertexTexCoord;
+	attribute vec3 vertexNormal;
+	attribute vec4 vertexColor;
+
+	// Input uniform values
+	uniform mat4 mvp;
+
+	// Output vertex attributes (to fragment shader)
+	varying vec2 fragTexCoord;
+	varying vec4 fragColor;
+
+	// NOTE: Add here your custom variables
+
+	void main()
+	{
+		// Send vertex attributes to fragment shader
+		fragTexCoord = vertexTexCoord;
+		fragColor = vertexColor;
+
+		// Calculate final vertex position
+		gl_Position = mvp*vec4(vertexPosition, 1.0);
+	}`
+
+	frag_code := `#version 100
+
+	precision mediump float;
 
 	// Input vertex attributes (from vertex shader)
-	in vec2 fragTexCoord;
-	in vec4 fragColor;
+	varying vec2 fragTexCoord;
+	varying vec4 fragColor;
 
 	// Input uniform values
 	uniform sampler2D texture0;
 	uniform vec4 colDiffuse;
 
-	// Output fragment color
-	out vec4 finalColor;
-
 	// NOTE: Render size values should be passed from code
-	const float renderWidth = %%WIDTH%%;
-	const float renderHeight = %%HEIGHT%%;
+	const float renderWidth = %%WIDTH%%.0;
+	const float renderHeight = %%HEIGHT%%.0;
 
-	float radius = renderHeight / 5;
+	const float radius = renderHeight / 5.0;
 
-	uniform vec2 pos = vec2(200.0, 200.0);
+	uniform vec2 pos;
 
 	void main()
 	{
@@ -616,10 +642,10 @@ init :: proc() {
 
 		if (dist < radius)
 		{
-			vec4 color = texture(texture0, fragTexCoord)*colDiffuse*fragColor;
-			finalColor = vec4(color.rgb, 1 - dist/radius);
+			vec4 color = texture2D(texture0, fragTexCoord)*colDiffuse*fragColor;
+			gl_FragColor = vec4(color.rgb, 1.0 - dist/radius);
 		} else {
-			finalColor = vec4(0, 0, 0, 0);
+			gl_FragColor = vec4(0, 0, 0, 0);
 		}
 	}
 	`
@@ -632,22 +658,22 @@ init :: proc() {
 	shipping_unit = &ctx.units[0]
 
 
-	shader_code, _ = strings.replace(
-		shader_code,
+	frag_code, _ = strings.replace(
+		frag_code,
 		"%%WIDTH%%",
 		fmt.tprint(rl.GetRenderWidth()),
 		1,
 		allocator = context.temp_allocator,
 	)
-	shader_code, _ = strings.replace(
-		shader_code,
+	frag_code, _ = strings.replace(
+		frag_code,
 		"%%HEIGHT%%",
 		fmt.tprint(rl.GetRenderHeight()),
 		1,
 		allocator = context.temp_allocator,
 	)
 
-	grid_shader = rl.LoadShaderFromMemory(nil, fmt.ctprint(shader_code))
+	grid_shader = rl.LoadShaderFromMemory(fmt.ctprint(vertex_code), fmt.ctprint(frag_code))
 
 	new_unit = create_unit(.GooExtractor)
 
