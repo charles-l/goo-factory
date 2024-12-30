@@ -107,3 +107,69 @@ Maybe support some kind of depth map too for VFX.
 **Static allocator so the dang web build works**.
 This is the second time I've been burned by WASM memory allocation breaking my web build. 
 I should really have learned my lesson :|
+
+---
+
+# 2024/12/30: Hacking the web build
+
+After some investigation, it turns out wasm memory allocations were working, it's just odin map inserts that were failing.
+
+```
+    at index.wasm.runtime.default_assertion_contextless_failure_proc (index.wasm:0x1e96cb)
+    at index.wasm.runtime.default_assertion_failure_proc (index.wasm:0x1e3c00)
+    at index.wasm.runtime.panic (index.wasm:0x10513d)
+    at index.wasm.runtime.map_alloc_dynamic (index.wasm:0x1c5180)
+    at index.wasm.runtime.map_reserve_dynamic (index.wasm:0x1fe4b2)
+    at index.wasm.runtime.__dynamic_map_reserve-2053 (index.wasm:0x1b876b)
+    at index.wasm.runtime.reserve_map-23931 (index.wasm:0x1b851d)
+    at index.wasm.runtime.make_map-20883 (index.wasm:0x17b777)
+    at index.wasm.game.init (index.wasm:0xdf48c)
+
+```
+
+**TL;DR for the fix:** Pass `-sMALLOC=mimalloc` to your `emcc` command and it should work.
+
+*Side note: to get more sensible tracebacks, I compiled my odin code with `-debug` and passed `-g` to `emcc` 
+so it would compile debug info to at least include function names in the WASM tracebacks.*
+
+Panics, unfortunately do not log to the console, so I was left using trial and error to track down the problem.
+
+I dug into the Odin `map_alloc_dynamic` function to see what went wrong.
+There's a suspicious [panic regarding alignment](https://github.com/odin-lang/Odin/blob/master/base/runtime/dynamic_map_internal.odin#L385), 
+and sure enough when I tried copying the code into my project and checking the alignment it was incorrectly aligned:
+
+```
+data, _ := mem_alloc_non_zeroed(128, runtime.MAP_CACHE_LINE_SIZE)
+data_ptr := uintptr(raw_data(data))
+
+CACHE_MASK :: MAP_CACHE_LINE_SIZE - 1
+log.info(date_ptr & CACHE_MASK == 0) // logged "false"
+```
+
+Odin requires that pointer alignment for map allocations [needs to be at least 64 **bytes**](https://github.com/odin-lang/Odin/blob/master/base/runtime/dynamic_map_internal.odin#L59-L63) 
+for the sake of bit twiddling zero bytes to store info about the capacity.
+
+The template I based my project off of 
+[uses the `raylib.MemAllocator`](https://github.com/Aronicu/Raylib-WASM/blob/fdad8c121b3032f898e5f6601c201f2aef697c43/src/game/game_null.odin#L32) 
+so we can alloc on WASM using emscripten's malloc.
+Unfortunately, this allocator [ignores the `alignment`](https://github.com/odin-lang/Odin/blob/ad99d20d292ab4708996c935315c36aef58796a8/vendor/raylib/raylib.odin#L1767-L1796) 
+parameter entirely.
+Since the default alignment in emscripten's default [malloc is 8 bytes](https://github.com/emscripten-core/emscripten/blob/5a8d9e52bd6bd34e0455658af2f4a188f78e8ad3/system/lib/dlmalloc.c#L41)
+
+Apparently you can define `MALLOC_ALIGNMENT` before the malloc header is compiled, but I couldn't figure out how to do this easily from the `emcc` invocation.
+
+Fortunately, it's easy to swap the malloc implementation with `-sMALLOC=`, 
+and it turns out `mimalloc` must have a larger alignment, because setting the malloc implementation to that worked.
+
+
+This is *not* a good solution. Better options would be force a `#define MALLOC_ALIGNMENT 64` somewhere or to use an entirely different default allocator in odin,
+but I've already burned half a day digging into this, and I don't really enjoy digging into emscripten code lol.
+
+## Alternate approaches
+
+I did try using the builtin [WASM allocator](https://github.com/odin-lang/Odin/blob/ad99d20d292ab4708996c935315c36aef58796a8/base/runtime/wasm_allocator.odin) instead, 
+but I don't think memory allocation intrinsics work for `freestanding_wasm32` in Odin. 
+In my test `intrinsics.wasm_memory_grow` always returned `-1`, so that didn't fly. 
+I think the wasm allocator works with `js_wasm32`, but I need a freestanding build to integrate with raylib via emscripten.
+
+I could have used a static arena allocator, but I was relying on `free` which doesn't work with allocators so that would have technically given me a memory leak...
